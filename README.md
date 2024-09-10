@@ -1,4 +1,4 @@
- <h6> VLMFromScratch </h6>
+ <h3> VLMFromScratch </h3>
  
 <h5> 
   
