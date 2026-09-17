@@ -70,9 +70,11 @@ def test_parse_detections_scales_to_image_size():
     text = "<loc0000><loc0000><loc1023><loc1023> cat ; <loc0511><loc0511><loc1023><loc1023> dog"
     dets = parse_detections(text, image_width=200, image_height=100)
     assert [d.label for d in dets] == ["cat", "dog"]
-    assert dets[0].box == (0.0, 0.0, 200.0, 100.0)
+    # order is y_min, x_min, y_max, x_max on a 1024 grid; x scales by width, y by height
+    x0, y0, x1, y1 = dets[0].box
+    assert (x0, y0) == (0.0, 0.0) and abs(x1 - 199.8) < 0.01 and abs(y1 - 99.9) < 0.01
     x0, y0, x1, y1 = dets[1].box
-    assert abs(x0 - 99.9) < 0.1 and abs(y0 - 49.95) < 0.1 and x1 == 200.0 and y1 == 100.0
+    assert abs(x0 - 99.8) < 0.01 and abs(y0 - 49.9) < 0.01
 
 
 def test_draw_detections_returns_image():

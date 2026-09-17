@@ -4,8 +4,8 @@ For the ``detect <object>`` task PaliGemma emits, per object::
 
     <locYMIN><locXMIN><locYMAX><locXMAX> label ; <loc..>... label2
 
-Each ``<locNNNN>`` is a coordinate quantised to 1024 bins over the *resized*
-image, so we rescale to the original resolution.
+Each ``<locNNNN>`` is a coordinate normalised to a 1024x1024 grid: divide by 1024,
+then multiply ``y`` by the image height and ``x`` by its width.
 """
 
 from __future__ import annotations
@@ -30,8 +30,9 @@ class Detection:
 
 
 def loc_to_coord(loc_value: int, extent: int, num_bins: int = 1024) -> float:
-    """Map a quantised bin in [0, num_bins) to a pixel coordinate in [0, extent]."""
-    return (loc_value / (num_bins - 1)) * extent
+    """Map a quantised bin to a pixel coordinate: ``value / 1024 * extent``
+    (the convention documented in the PaliGemma release blog)."""
+    return (loc_value / num_bins) * extent
 
 
 def parse_detections(text: str, image_width: int, image_height: int) -> list[Detection]:

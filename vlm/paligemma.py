@@ -91,7 +91,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
 
         # Gemma applies sqrt(hidden) to *all* input embeddings; pre-divide image features
         # so they end up at their native scale after that multiplication.
-        scaled_image_features = image_features / (self.config.hidden_size**0.5)
+        scaled_image_features = image_features / (self.config.text_config.hidden_size**0.5)
 
         final_embedding = torch.zeros(batch_size, sequence_length, embed_dim, dtype=dtype, device=device)
 
