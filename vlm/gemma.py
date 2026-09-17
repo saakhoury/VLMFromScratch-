@@ -207,3 +207,102 @@ class GemmaAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)  # [B, H, Sq, Dh]
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)  # [B, Sq, H*Dh]
         return self.o_proj(attn_output), attn_weights
+
+
+class GemmaMLP(nn.Module):
+    """GeGLU feed-forward: down(gelu(gate(x)) * up(x))."""
+
+    def __init__(self, config: GemmaConfig) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
+
+
+class GemmaDecoderLayer(nn.Module):
+    def __init__(self, config: GemmaConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.self_attn = GemmaAttention(config, layer_idx)
+        self.mlp = GemmaMLP(config)
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(hidden_states, attention_mask, position_ids, kv_cache)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
+
+class GemmaModel(nn.Module):
+    def __init__(self, config: GemmaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+    ) -> torch.Tensor:
+        # Gemma scales embeddings by sqrt(hidden_size) before the first layer.
+        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        hidden_states = inputs_embeds * normalizer
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask, position_ids, kv_cache)
+        return self.norm(hidden_states)
+
+
+class GemmaForCausalLM(nn.Module):
+    """Gemma with a language-modelling head whose weight is tied to the token embedding."""
+
+    def __init__(self, config: GemmaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.model = GemmaModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.tie_weights()
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    def tie_weights(self) -> None:
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+    ) -> dict:
+        hidden_states = self.model(inputs_embeds, attention_mask, position_ids, kv_cache)
+        logits = self.lm_head(hidden_states).float()
+        out = {"logits": logits}
+        if kv_cache is not None:
+            out["kv_cache"] = kv_cache
+        return out
