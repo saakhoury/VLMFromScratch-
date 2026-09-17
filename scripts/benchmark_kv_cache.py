@@ -10,8 +10,12 @@ Run: python scripts/benchmark_kv_cache.py [--max_len 8192] [--gen 128]
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vlm.configs import paligemma_3b_224
 from vlm.gemma import KVCache
