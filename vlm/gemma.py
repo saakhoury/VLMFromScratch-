@@ -102,3 +102,108 @@ def apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+class KVCache:
+    """Per-layer key/value cache grown by ``torch.cat`` along the sequence axis.
+
+    Growing by concatenation means the cache is always exactly as long as the
+    number of tokens seen so far. A pre-allocated cache of ``max_position_embeddings``
+    would reserve ``B * L * H_kv * S_max * Dh`` per K and V regardless of prompt
+    length (see ``scripts/benchmark_kv_cache.py`` for the measured saving).
+    """
+
+    def __init__(self) -> None:
+        self.key_cache: list[torch.Tensor] = []
+        self.value_cache: list[torch.Tensor] = []
+
+    def num_items(self) -> int:
+        if len(self.key_cache) == 0:
+            return 0
+        # [B, H_kv, S, Dh]
+        return self.key_cache[0].shape[-2]
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(self.key_cache) <= layer_idx:
+            # first time this layer is seen (prefill): store as-is
+            self.key_cache.append(key_states)
+            self.value_cache.append(value_states)
+        else:
+            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def memory_bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self.key_cache + self.value_cache)
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """[B, H_kv, S, Dh] -> [B, H_kv * n_rep, S, Dh] so each query group shares one KV head."""
+    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+
+class GemmaAttention(nn.Module):
+    """Grouped-query attention (Ainslie et al., 2023): ``num_attention_heads`` query
+    heads share ``num_key_value_heads`` key/value heads (Gemma-2B uses 8 -> 1, i.e. MQA).
+    Fewer KV heads shrink both the projection weights and the KV cache."""
+
+    def __init__(self, config: GemmaConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        self.rotary_emb = GemmaRotaryEmbedding(
+            self.head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, q_len, _ = hidden_states.size()
+
+        # [B, S, D] -> [B, H, S, Dh] / [B, H_kv, S, Dh]
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if kv_cache is not None:
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
+
+        # broadcast the KV heads across their query group
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # [B, H, Sq, Dh] @ [B, H, Dh, Skv] -> [B, H, Sq, Skv]
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+
+        attn_output = torch.matmul(attn_weights, value_states)  # [B, H, Sq, Dh]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)  # [B, Sq, H*Dh]
+        return self.o_proj(attn_output), attn_weights
