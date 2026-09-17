@@ -1,0 +1,63 @@
+{
+  "torch": "2.9.1",
+  "kv_cache_mb": {
+    "Static cache max_len = 8192": 144.0,
+    "Static cache max_len = 640": 11.25,
+    "Concatenation (exact length, GQA)": 7.03,
+    "Concatenation, full MHA (8 KV heads)": 56.25
+  },
+  "kv_concat_vs_static640_saving_pct": 37.5,
+  "kv_concat_vs_static8192_saving_pct": 95.1,
+  "throughput": {
+    "device": "mps",
+    "autocast_dtype": "float16",
+    "rows": [
+      {
+        "hidden": 512,
+        "params_M": 52.8,
+        "fp32": 46.9,
+        "autocast": 39.3,
+        "half weights": 36.8,
+        "autocast_speedup": 0.84,
+        "half_speedup": 0.78,
+        "weights_MB_fp32": 211.0,
+        "weights_MB_half": 106.0
+      },
+      {
+        "hidden": 1024,
+        "params_M": 176.2,
+        "fp32": 34.7,
+        "autocast": 35.2,
+        "half weights": 35.1,
+        "autocast_speedup": 1.01,
+        "half_speedup": 1.01,
+        "weights_MB_fp32": 705.0,
+        "weights_MB_half": 352.0
+      },
+      {
+        "hidden": 1536,
+        "params_M": 375.0,
+        "fp32": 26.1,
+        "autocast": 14.1,
+        "half weights": 9.8,
+        "autocast_speedup": 0.54,
+        "half_speedup": 0.38,
+        "weights_MB_fp32": 1500.0,
+        "weights_MB_half": 750.0
+      }
+    ],
+    "note": "12-layer decoder + 6-layer SigLIP, random weights, 32 generated tokens, best of 3 after warm-up",
+    "machine": "arm"
+  },
+  "detection_decoder_demo": [
+    {
+      "label": "dog",
+      "box": [
+        157.5,
+        277.03,
+        490.0,
+        441.09
+      ]
+    }
+  ]
+}
