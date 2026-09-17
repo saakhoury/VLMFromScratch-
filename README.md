@@ -159,6 +159,7 @@ pre-trained; the `-mix-` checkpoints follow free-form prompts better and load wi
 ### Use as a library
 
 ```python
+import torch
 from PIL import Image
 from vlm.utils import load_hf_model, get_device, autocast_context
 from vlm.processing import PaliGemmaProcessor
