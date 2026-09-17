@@ -67,3 +67,113 @@ class SiglipVisionEmbeddings(nn.Module):
         # [B, D, Hp, Wp] -> [B, D, Np] -> [B, Np, D]
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
         return embeddings + self.position_embedding(self.position_ids)
+
+
+class SiglipAttention(nn.Module):
+    """Standard multi-head self-attention (no masking: every patch sees every patch)."""
+
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = self.head_dim**-0.5
+        self.dropout = config.attention_dropout
+
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, seq_len, _ = hidden_states.size()
+        # [B, N, D] -> [B, H, N, Dh]
+        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # [B, H, N, Dh] @ [B, H, Dh, N] -> [B, H, N, N]
+        attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scale
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+
+        # [B, H, N, N] @ [B, H, N, Dh] -> [B, H, N, Dh]
+        attn_output = torch.matmul(attn_weights, v)
+        # [B, H, N, Dh] -> [B, N, H, Dh] -> [B, N, D]
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, self.embed_dim)
+        return self.out_proj(attn_output), attn_weights
+
+
+class SiglipMLP(nn.Module):
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = nn.functional.gelu(hidden_states, approximate="tanh")
+        return self.fc2(hidden_states)
+
+
+class SiglipEncoderLayer(nn.Module):
+    """Pre-LayerNorm transformer block: x + Attn(LN1(x)); x + MLP(LN2(x))."""
+
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.self_attn = SiglipAttention(config)
+        self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp = SiglipMLP(config)
+        self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states, _ = self.self_attn(self.layer_norm1(hidden_states))
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.mlp(self.layer_norm2(hidden_states))
+        return residual + hidden_states
+
+
+class SiglipEncoder(nn.Module):
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        hidden_states = inputs_embeds
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+        return hidden_states
+
+
+class SiglipVisionTransformer(nn.Module):
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embeddings = SiglipVisionEmbeddings(config)
+        self.encoder = SiglipEncoder(config)
+        self.post_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        # [B, C, H, W] -> [B, Np, D]
+        hidden_states = self.embeddings(pixel_values)
+        hidden_states = self.encoder(hidden_states)
+        return self.post_layernorm(hidden_states)
+
+
+class SiglipVisionModel(nn.Module):
+    """Top-level wrapper; matches the ``vision_tower.vision_model`` checkpoint prefix."""
+
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.vision_model = SiglipVisionTransformer(config)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Returns one contextualised embedding per patch: [B, num_patches, hidden_size]."""
+        return self.vision_model(pixel_values)
