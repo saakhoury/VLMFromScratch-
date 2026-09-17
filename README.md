@@ -62,13 +62,13 @@ and lets you turn it off with `--autocast False`.
 
 The decoder exercised on the example output from the [PaliGemma release blog](https://huggingface.co/blog/paligemma)
 (`<loc0591><loc0252><loc0941><loc0784> dog`). This shows the parser and 1024-grid rescaling on a
-synthetic scene; it is **not** a model prediction — run [`scripts/run_real_demo.py`](scripts/run_real_demo.py) for those.
+synthetic scene; it is **not** a model prediction.
 
 ![Detection decoder demo](assets/detection_decoder.png)
 
-Real-weight results (captions, VQA answers, detection overlays on COCO images) are produced by
-`scripts/run_real_demo.py` into `assets/real/results.md`. It needs ~12 GB of disk and ≥ 8 GB of GPU memory
-or a ≥ 16 GB Mac, and runs unchanged on a free Colab T4 — see [Run on real weights](#run-on-real-weights).
+Real-weight results (captions, VQA answers, detection overlays) are not included yet: producing them
+needs ~12 GB of disk and ≥ 8 GB of GPU memory or a ≥ 16 GB Mac. `scripts/run_real_demo.py` generates
+them into `assets/real/` and runs unchanged on a free Colab T4 — see [Run on real weights](#run-on-real-weights).
 
 ## Architecture
 
