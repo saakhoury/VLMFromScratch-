@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.DS_Store
+# model weights / outputs
+weights/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+outputs/
+*.log

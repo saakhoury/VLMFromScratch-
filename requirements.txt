@@ -1,0 +1,7 @@
+torch>=2.1
+numpy>=1.24
+pillow>=9.0
+safetensors>=0.4
+transformers>=4.40   # tokenizer only (Gemma SentencePiece tokenizer + <loc>/<seg> tokens)
+fire>=0.5
+pytest>=7.0

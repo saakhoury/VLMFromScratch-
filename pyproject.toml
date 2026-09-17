@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlm-from-scratch"
+version = "0.1.0"
+description = "PyTorch reproduction of PaliGemma with SigLIP, grouped query attention, RoPE and KV-cache"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1", "numpy>=1.24", "pillow>=9.0", "safetensors>=0.4", "transformers>=4.40", "fire>=0.5"]
+
+[tool.setuptools.packages.find]
+include = ["vlm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
