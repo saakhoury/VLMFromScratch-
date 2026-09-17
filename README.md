@@ -117,7 +117,7 @@ prefill and in every cached decode step, which [`vlm/paligemma.py`](vlm/paligemm
 ## Quickstart
 
 ```bash
-git clone https://github.com/<you>/VLMFromScratch-.git && cd VLMFromScratch-
+git clone https://github.com/saakhoury/VLMFromScratch-.git && cd VLMFromScratch-
 pip install -r requirements.txt
 
 python -m pytest -q                     # 24 tests, < 1 s on CPU
