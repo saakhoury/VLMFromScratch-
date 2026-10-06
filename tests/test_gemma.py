@@ -91,3 +91,20 @@ def test_lm_head_is_tied_to_embeddings():
     model = GemmaForCausalLM(cfg())
     assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
     assert "lm_head.weight" in model.state_dict()
+
+
+def test_static_kv_cache_preallocates_and_tracks_used_tokens():
+    cache = KVCache(max_length=10)
+    k = torch.randn(1, 2, 5, 8)
+    keys, values = cache.update(k, k, 0)
+
+    assert cache.strategy == "static"
+    assert cache.num_items() == 5
+    assert keys.shape[-2] == 5 and values.shape[-2] == 5
+    assert cache.memory_bytes() == 2 * 1 * 2 * 10 * 8 * 4
+    assert cache.used_memory_bytes() == 2 * 1 * 2 * 5 * 8 * 4
+
+    k1 = torch.randn(1, 2, 1, 8)
+    keys, _ = cache.update(k1, k1, 0)
+    assert cache.num_items() == 6
+    assert torch.equal(keys[:, :, -1], k1[:, :, 0])

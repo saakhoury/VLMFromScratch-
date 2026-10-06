@@ -2,7 +2,7 @@
 
 Reference: Gemma Team, "Gemma: Open Models Based on Gemini Research and Technology" (2024).
 Implements RMSNorm (Gemma's ``1 + weight`` variant), rotary position embeddings,
-grouped-query attention with a concatenation-based KV cache, GeGLU MLP and
+grouped-query attention with configurable growing/static KV caches, GeGLU MLP and
 weight tying between the token embedding and the LM head.
 """
 
@@ -105,39 +105,105 @@ def apply_rotary_pos_emb(
 
 
 class KVCache:
-    """Per-layer key/value cache grown by ``torch.cat`` along the sequence axis.
+    """Per-layer key/value cache with two explicit allocation policies.
 
-    Growing by concatenation means the cache is always exactly as long as the
-    number of tokens seen so far. A pre-allocated cache of ``max_position_embeddings``
-    would reserve ``B * L * H_kv * S_max * Dh`` per K and V regardless of prompt
-    length (see ``scripts/benchmark_kv_cache.py`` for the measured saving).
+    ``max_length=None`` is the original growing policy: the cache is exactly
+    as long as the tokens seen and grows with ``torch.cat``. This minimizes
+    reserved memory but copies the existing cache on every decode step.
+
+    ``max_length=N`` is a static policy: each layer reserves capacity for N
+    tokens during prefill and later tokens are written in-place. This spends
+    more memory up front but avoids repeated cache reallocation/copies.
+
+    Both policies expose the same ``update`` / ``num_items`` contract so the
+    attention implementation does not depend on the cache strategy.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_length: Optional[int] = None) -> None:
+        if max_length is not None and max_length <= 0:
+            raise ValueError("max_length must be positive")
+        self.max_length = max_length
         self.key_cache: list[torch.Tensor] = []
         self.value_cache: list[torch.Tensor] = []
+        self._lengths: list[int] = []
+
+    @property
+    def strategy(self) -> str:
+        return "static" if self.max_length is not None else "growing"
 
     def num_items(self) -> int:
-        if len(self.key_cache) == 0:
+        if len(self._lengths) == 0:
             return 0
-        # [B, H_kv, S, Dh]
-        return self.key_cache[0].shape[-2]
+        return self._lengths[0]
 
     def update(
         self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = key_states.shape[-2]
+
         if len(self.key_cache) <= layer_idx:
-            # first time this layer is seen (prefill): store as-is
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
+            if self.max_length is None:
+                self.key_cache.append(key_states)
+                self.value_cache.append(value_states)
+            else:
+                if seq_len > self.max_length:
+                    raise ValueError(
+                        f"Prefill length {seq_len} exceeds static KV-cache capacity {self.max_length}"
+                    )
+                cache_shape = list(key_states.shape)
+                cache_shape[-2] = self.max_length
+                key_cache = torch.empty(
+                    cache_shape, dtype=key_states.dtype, device=key_states.device
+                )
+                value_cache = torch.empty(
+                    cache_shape, dtype=value_states.dtype, device=value_states.device
+                )
+                key_cache[..., :seq_len, :].copy_(key_states)
+                value_cache[..., :seq_len, :].copy_(value_states)
+                self.key_cache.append(key_cache)
+                self.value_cache.append(value_cache)
+            self._lengths.append(seq_len)
+        elif self.max_length is None:
+            self.key_cache[layer_idx] = torch.cat(
+                [self.key_cache[layer_idx], key_states], dim=-2
+            )
+            self.value_cache[layer_idx] = torch.cat(
+                [self.value_cache[layer_idx], value_states], dim=-2
+            )
+            self._lengths[layer_idx] += seq_len
         else:
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+            start = self._lengths[layer_idx]
+            end = start + seq_len
+            if end > self.max_length:
+                raise ValueError(
+                    f"KV-cache length {end} exceeds static capacity {self.max_length}"
+                )
+            self.key_cache[layer_idx][..., start:end, :].copy_(key_states)
+            self.value_cache[layer_idx][..., start:end, :].copy_(value_states)
+            self._lengths[layer_idx] = end
+
+        length = self._lengths[layer_idx]
+        return (
+            self.key_cache[layer_idx][..., :length, :],
+            self.value_cache[layer_idx][..., :length, :],
+        )
 
     def memory_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self.key_cache + self.value_cache)
+        """Allocated cache bytes, including unused static capacity."""
+        return sum(
+            t.numel() * t.element_size()
+            for t in self.key_cache + self.value_cache
+        )
 
+    def used_memory_bytes(self) -> int:
+        """Bytes occupied by logically used K/V tokens."""
+        total = 0
+        for layer_idx, length in enumerate(self._lengths):
+            key = self.key_cache[layer_idx]
+            value = self.value_cache[layer_idx]
+            total += key[..., :length, :].numel() * key.element_size()
+            total += value[..., :length, :].numel() * value.element_size()
+        return total
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """[B, H_kv, S, Dh] -> [B, H_kv * n_rep, S, Dh] so each query group shares one KV head."""
