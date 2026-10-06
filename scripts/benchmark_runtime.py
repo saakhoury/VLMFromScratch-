@@ -25,7 +25,6 @@ import os
 import platform
 import statistics
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
