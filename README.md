@@ -6,7 +6,7 @@ execution decisions—multimodal fusion, cache policy, precision, device placeme
 explicit instead of hiding them behind a large inference framework.
 
 Every module in [`vlm/`](vlm/) is hand-written: the SigLIP vision transformer, multi-head and
-grouped-query attention, rotary position embeddings, RMSNorm, a concatenation-grown KV-cache,
+grouped-query attention, rotary position embeddings, RMSNorm, configurable growing/static KV caches,
 multimodal token merging, weight tying and nucleus sampling. Nothing is imported from
 `transformers` except the SentencePiece tokenizer.
 
@@ -16,7 +16,7 @@ multimodal token merging, weight tying and nucleus sampling. Nothing is imported
 
 | | |
 |---|---|
-| **Grouped-query attention + RoPE** | 8 query heads share 1 KV head (Gemma-2B). The KV-cache holds only the shared head and is grown with `torch.cat`, so it is exactly `prefix + generated` tokens long. **37.5 % less KV memory** than a static 640-token cache, 95 % less than the model's full 8192 context, 8× less than full MHA. |
+| **Grouped-query attention + RoPE** | 8 query heads share 1 KV head (Gemma-2B). The runtime supports an exact-length growing cache and a preallocated static cache behind the same interface; GQA stores one shared KV head rather than eight, sharply reducing cache memory. |
 | **Vision-language fusion** | Custom SigLIP encoder (27 pre-LN layers for the 3B weights; 6 in the small preset) → linear projector → features scattered into the `<image>` slots of a Gemma decoder (18 layers for the 3B weights, **12 layers** in the `paligemma_small` preset). Bidirectional prefix attention, causal generation. |
 | **Detection** | `detect <object>` prompts decode to `<locYYYY>` tokens on a 1024-grid; [`vlm/detection.py`](vlm/detection.py) rescales them to pixel boxes and draws them. |
 | **Runtime controls** | CUDA → MPS → CPU placement, explicit weight dtype, autocast compute policy, growing vs. static KV-cache strategies, top-p/greedy decoding, shard-streamed SafeTensors loading, stage profiling and reproducible benchmark artifacts. |
@@ -39,6 +39,18 @@ Analytical footprint for the Gemma-2B decoder config (18 layers, 1 KV head × 25
 | **Concatenation, exact length, GQA (this repo)** | **7.03** | 1× |
 | Concatenation, full MHA (8 KV heads) | 56.25 | 8× |
 
+### Validated cache-policy sweep on Apple MPS
+
+Measured on the 52.8M-parameter `paligemma_small` preset on Apple MPS after 2 warm-up rounds and 7 paired trials per generation budget. Strategy order alternated every trial to reduce execution-order bias, and every pair was required to produce identical greedy output.
+
+| Generation budget | Growing tok/s | Static tok/s | Static / growing | Growing p50 decode | Static p50 decode |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 42.2 | 40.9 | 0.97× | 15.17 ms | 15.12 ms |
+| 16 | 40.7 | 46.0 | 1.13× | 18.98 ms | 16.85 ms |
+| 32 | 45.8 | 51.0 | 1.11× | 19.41 ms | 17.08 ms |
+| 64 | 47.3 | 53.1 | 1.12× | 19.30 ms | 17.15 ms |
+
+**Interpretation:** there is no universally best cache policy. At 8 generated tokens the exact-length growing cache is slightly faster. From 16–64 tokens, the preallocated static cache is about **11–13% faster** in median throughput on this machine because it avoids repeated `torch.cat` copies during decode. The two policies use nearly identical memory at these short budgets because the ~260-token multimodal prefix dominates cache size. Most importantly, **growing output == static output across every paired trial**, so the runtime optimization preserves greedy model semantics.
 ### Mixed precision on Apple MPS
 
 Measured on an 8 GB Apple M2 with the 12-layer decoder at three widths, batch-1 decode of 32 tokens,
@@ -112,7 +124,7 @@ flowchart LR
     TOK --> EMB["Embedding × √d"]
     PROJ --> MERGE["masked_scatter into<br/>&lt;image&gt; slots"]
     EMB --> MERGE
-    MERGE --> DEC["Gemma decoder · 18 layers<br/>GQA 8→1 KV head · RoPE<br/>RMSNorm(1+w) · GeGLU · concat KV-cache"]
+    MERGE --> DEC["Gemma decoder · 18 layers<br/>GQA 8→1 KV head · RoPE<br/>RMSNorm(1+w) · GeGLU · configurable KV-cache"]
     DEC --> HEAD["tied LM head<br/>top-p sampling"]
     HEAD --> OUT["&lt;loc0591&gt;&lt;loc0252&gt;&lt;loc0941&gt;&lt;loc0784&gt; dog"]
 ```
