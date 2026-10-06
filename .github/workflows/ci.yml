@@ -16,3 +16,4 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - run: python -m pytest -q
+      - run: python scripts/benchmark_runtime.py --preset tiny --tokens 4 --warmup 0 --trials 1 --no-autocast
