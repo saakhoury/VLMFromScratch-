@@ -1,8 +1,9 @@
 # VLMFromScratch
 
-**A from-scratch PyTorch reproduction of PaliGemma** — Google's 3B vision-language model — that loads the
-released SafeTensors checkpoint and runs captioning, visual question answering and object detection on
-CUDA, Apple MPS or CPU.
+**A small multimodal inference runtime built from first principles around PaliGemma.** It reproduces Google's
+3B vision-language architecture, loads the released SafeTensors checkpoint directly, and makes model
+execution decisions—multimodal fusion, cache policy, precision, device placement, decoding and profiling—
+explicit instead of hiding them behind a large inference framework.
 
 Every module in [`vlm/`](vlm/) is hand-written: the SigLIP vision transformer, multi-head and
 grouped-query attention, rotary position embeddings, RMSNorm, a concatenation-grown KV-cache,
@@ -18,7 +19,7 @@ multimodal token merging, weight tying and nucleus sampling. Nothing is imported
 | **Grouped-query attention + RoPE** | 8 query heads share 1 KV head (Gemma-2B). The KV-cache holds only the shared head and is grown with `torch.cat`, so it is exactly `prefix + generated` tokens long. **37.5 % less KV memory** than a static 640-token cache, 95 % less than the model's full 8192 context, 8× less than full MHA. |
 | **Vision-language fusion** | Custom SigLIP encoder (27 pre-LN layers for the 3B weights; 6 in the small preset) → linear projector → features scattered into the `<image>` slots of a Gemma decoder (18 layers for the 3B weights, **12 layers** in the `paligemma_small` preset). Bidirectional prefix attention, causal generation. |
 | **Detection** | `detect <object>` prompts decode to `<locYYYY>` tokens on a 1024-grid; [`vlm/detection.py`](vlm/detection.py) rescales them to pixel boxes and draws them. |
-| **Production inference** | CUDA → MPS → CPU auto-placement, `torch.autocast` (bf16 on CUDA, fp16 on MPS), half-precision weight loading, top-p sampling, SafeTensors shard loading with strict key checking. |
+| **Runtime controls** | CUDA → MPS → CPU placement, explicit weight dtype, autocast compute policy, growing vs. static KV-cache strategies, top-p/greedy decoding, shard-streamed SafeTensors loading and runtime profiling. |
 | **Verified against the real checkpoint** | Config, preprocessor and all 300+ weight names match `google/paligemma-3b-pt-224` (checked via its ungated mirror, see [Verification](#verification-against-the-released-checkpoint)). |
 
 ## Results
@@ -70,6 +71,24 @@ Real-weight results (captions, VQA answers, detection overlays) are not included
 needs ~12 GB of disk and ≥ 8 GB of GPU memory or a ≥ 16 GB Mac. `scripts/run_real_demo.py` generates
 them into `assets/real/` and runs unchanged on a free Colab T4 — see [Run on real weights](#run-on-real-weights).
 
+## Runtime as a product
+
+The repo is organized around four boundaries rather than around one notebook:
+
+1. **Artifact contract** — config, tokenizer and SafeTensors names must match the released checkpoint.
+2. **Model contract** — SigLIP, projector and Gemma reproduce the mathematical execution path.
+3. **Runtime policy** — device, stored dtype, autocast, cache allocation and decode strategy are explicit knobs.
+4. **Verification** — tiny/small/3B presets let the same code path serve unit tests, laptop profiling and real-weight inference.
+
+The fastest demo that does not require a 12 GB checkpoint is:
+
+```bash
+python scripts/benchmark_runtime.py --preset small --tokens 16
+```
+
+It executes the actual multimodal prefill/decode path twice—growing and static cache—and fails if the
+optimization changes greedy model output. With real weights available, use `inference.py --profile True`
+to run caption/VQA/detection on an image and print the same runtime measurements.
 ## Architecture
 
 ```mermaid
@@ -96,17 +115,22 @@ flowchart LR
 | Runtime | [`vlm/utils.py`](vlm/utils.py) | `get_device()`, `autocast_context()`, `load_hf_model()` with SafeTensors shards and tied-weight handling |
 | Presets | [`vlm/configs.py`](vlm/configs.py) | `paligemma_3b_224` (matches HF weights), `paligemma_small` (12-layer decoder), `paligemma_tiny` (tests) |
 
-### Why the KV-cache is grown by concatenation
+### Why cache strategy is explicit
 
 ```python
-# vlm/gemma.py
-self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
+# exact-length allocation: lower reserved memory, repeated copies
+KVCache()
+
+# fixed-capacity allocation: higher reserved memory, in-place writes
+KVCache(max_length=prompt_tokens + generation_budget)
 ```
 
-A static cache must be sized for the longest sequence you might ever generate and pays for it from
-step 0. Concatenating along the sequence axis keeps the cache exactly as long as the tokens seen, and
-because GQA stores one KV head instead of eight, each cached token costs 2 × 18 × 256 × 2 B = 18 KB.
-The trade-off is an O(S) copy per step; at PaliGemma's 128-token output budget that is negligible.
+The default growing cache keeps storage exactly as long as the sequence actually used, and because GQA
+stores one KV head instead of eight, each cached token costs 2 × 18 × 256 × 2 B = 18 KB. Its cost is an
+O(S) copy as `torch.cat` grows the cache each step. The static strategy reserves the full requested
+capacity once and then writes new K/V vectors in place. `scripts/benchmark_runtime.py` runs both through
+the same generation path and asserts that the greedy outputs are identical, making the memory/latency
+trade-off measurable instead of implicit.
 
 ### Prefix-LM attention
 
@@ -120,10 +144,11 @@ prefill and in every cached decode step, which [`vlm/paligemma.py`](vlm/paligemm
 git clone https://github.com/saakhoury/VLMFromScratch-.git && cd VLMFromScratch-
 pip install -r requirements.txt
 
-python -m pytest -q                     # 24 tests, < 1 s on CPU
-python scripts/smoke_test_device.py     # 12-layer preset end-to-end on your GPU / MPS with autocast
-python scripts/benchmark_kv_cache.py    # KV-cache memory table
-python scripts/make_figures.py          # regenerates assets/*.png and assets/results.json
+python -m pytest -q                     # 28 correctness / runtime tests
+python scripts/smoke_test_device.py     # 12-layer preset end-to-end on GPU / MPS / CPU
+python scripts/benchmark_runtime.py     # growing vs static cache on the real runtime path
+python scripts/benchmark_kv_cache.py    # analytical 3B KV-cache footprint
+python scripts/make_figures.py          # regenerate benchmark figures
 ```
 
 ### Run on real weights
@@ -141,7 +166,9 @@ Or drive the model yourself:
 python inference.py \
   --model_path weights/paligemma-3b-pt-224 \
   --prompt "detect cat" --image_file_path cat.jpg \
-  --max_tokens_to_generate 64 --save_detections_to boxes.jpg
+  --max_tokens_to_generate 64 \
+  --weight_dtype auto --cache_strategy growing --profile True \
+  --save_detections_to boxes.jpg
 ```
 
 | Flag | Default | Meaning |
@@ -150,8 +177,11 @@ python inference.py \
 | `--do_sample` | `False` | greedy when off; nucleus sampling when on |
 | `--temperature` / `--top_p` | `0.8` / `0.9` | sampling controls |
 | `--device` | auto | `cuda`, `mps` or `cpu` |
-| `--autocast` | `True` | bf16 on CUDA, fp16 on MPS |
-| `--save_detections_to` | — | writes an image with the parsed `<loc>` boxes drawn |
+| `--weight_dtype` | `auto` | stored weight precision: fp32 CPU, fp16 MPS, bf16/fp16 CUDA |
+| `--autocast` | `True` | accelerator-aware compute autocast |
+| `--cache_strategy` | `growing` | exact-length `torch.cat` cache or preallocated `static` cache |
+| `--profile` | `False` | print prefill, decode p50/p95, throughput and KV-cache bytes |
+| `--save_detections_to` | — | writes an image with parsed `<loc>` boxes drawn |
 
 `launch_inference.sh` wraps the same call with environment variables. The `-pt-` checkpoints are
 pre-trained; the `-mix-` checkpoints follow free-form prompts better and load with the same code.
@@ -197,7 +227,7 @@ Fetched on 2026-09-17 from the ungated mirror and from `transformers` v4.49.0 so
 ## Tests
 
 ```
-python -m pytest -q   →   24 passed
+python -m pytest -q   →   28 tests
 ```
 
 - RoPE preserves norms and is shift-invariant in dot products
@@ -213,7 +243,7 @@ python -m pytest -q   →   24 passed
 vlm/            siglip.py · gemma.py · paligemma.py · processing.py · detection.py · generate.py · utils.py · configs.py
 inference.py    CLI (fire) — device auto-placement, autocast, top-p, detection overlay
 scripts/        benchmark_kv_cache.py · make_figures.py · smoke_test_device.py · run_real_demo.py
-tests/          24 unit tests on the tiny preset
+tests/          correctness, cache-equivalence and runtime-policy tests
 assets/         generated figures + results.json
 ```
 
