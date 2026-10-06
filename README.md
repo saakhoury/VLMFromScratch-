@@ -19,7 +19,7 @@ multimodal token merging, weight tying and nucleus sampling. Nothing is imported
 | **Grouped-query attention + RoPE** | 8 query heads share 1 KV head (Gemma-2B). The KV-cache holds only the shared head and is grown with `torch.cat`, so it is exactly `prefix + generated` tokens long. **37.5 % less KV memory** than a static 640-token cache, 95 % less than the model's full 8192 context, 8× less than full MHA. |
 | **Vision-language fusion** | Custom SigLIP encoder (27 pre-LN layers for the 3B weights; 6 in the small preset) → linear projector → features scattered into the `<image>` slots of a Gemma decoder (18 layers for the 3B weights, **12 layers** in the `paligemma_small` preset). Bidirectional prefix attention, causal generation. |
 | **Detection** | `detect <object>` prompts decode to `<locYYYY>` tokens on a 1024-grid; [`vlm/detection.py`](vlm/detection.py) rescales them to pixel boxes and draws them. |
-| **Runtime controls** | CUDA → MPS → CPU placement, explicit weight dtype, autocast compute policy, growing vs. static KV-cache strategies, top-p/greedy decoding, shard-streamed SafeTensors loading and runtime profiling. |
+| **Runtime controls** | CUDA → MPS → CPU placement, explicit weight dtype, autocast compute policy, growing vs. static KV-cache strategies, top-p/greedy decoding, shard-streamed SafeTensors loading, stage profiling and reproducible benchmark artifacts. |
 | **Verified against the real checkpoint** | Config, preprocessor and all 300+ weight names match `google/paligemma-3b-pt-224` (checked via its ungated mirror, see [Verification](#verification-against-the-released-checkpoint)). |
 
 ## Results
@@ -86,9 +86,22 @@ The fastest demo that does not require a 12 GB checkpoint is:
 python scripts/benchmark_runtime.py --preset small --tokens 16
 ```
 
-It executes the actual multimodal prefill/decode path twice—growing and static cache—and fails if the
-optimization changes greedy model output. With real weights available, use `inference.py --profile True`
-to run caption/VQA/detection on an image and print the same runtime measurements.
+The benchmark warms up both cache policies, alternates execution order across paired trials, reports
+medians instead of a single run, and fails if growing/static caches change greedy model output.
+
+For a more useful systems experiment, sweep generation length and persist the full environment + results:
+
+```bash
+python scripts/benchmark_runtime.py \
+  --sweep 8,16,32,64 \
+  --warmup 2 --trials 7 \
+  --json-out assets/runtime_benchmark.json
+```
+
+This makes the cache decision empirical: you can see how allocation overhead and decode latency change
+as the generation budget grows, while the JSON artifact records device, PyTorch/Python versions,
+parameter count, weight bytes and benchmark methodology. With real weights available, use
+`inference.py --profile True` to run caption/VQA/detection on an image and print the same runtime metrics.
 ## Architecture
 
 ```mermaid
@@ -146,7 +159,7 @@ pip install -r requirements.txt
 
 python -m pytest -q                     # 28 correctness / runtime tests
 python scripts/smoke_test_device.py     # 12-layer preset end-to-end on GPU / MPS / CPU
-python scripts/benchmark_runtime.py     # growing vs static cache on the real runtime path
+python scripts/benchmark_runtime.py     # warmed, paired growing vs static cache benchmark
 python scripts/benchmark_kv_cache.py    # analytical 3B KV-cache footprint
 python scripts/make_figures.py          # regenerate benchmark figures
 ```
