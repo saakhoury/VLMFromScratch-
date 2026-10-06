@@ -39,6 +39,18 @@ Analytical footprint for the Gemma-2B decoder config (18 layers, 1 KV head × 25
 | **Concatenation, exact length, GQA (this repo)** | **7.03** | 1× |
 | Concatenation, full MHA (8 KV heads) | 56.25 | 8× |
 
+### Validated cache-policy sweep on Apple MPS
+
+Measured on the 52.8M-parameter `paligemma_small` preset on Apple MPS after 2 warm-up rounds and 7 paired trials per generation budget. Strategy order alternates every trial; every pair must produce identical greedy output.
+
+| Generation budget | Growing tok/s | Static tok/s | Static / growing | Growing p50 decode | Static p50 decode |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 42.2 | 40.9 | 0.97× | 15.17 ms | 15.12 ms |
+| 16 | 40.7 | 46.0 | 1.13× | 18.98 ms | 16.85 ms |
+| 32 | 45.8 | 51.0 | 1.11× | 19.41 ms | 17.08 ms |
+| 64 | 47.3 | 53.1 | 1.12× | 19.30 ms | 17.15 ms |
+
+**Interpretation:** there is no universally best cache policy. At 8 generated tokens the exact-length growing cache is slightly faster, while from 16–64 tokens the preallocated static cache is about **11–13% faster** in median throughput on this machine. The static cache spends essentially the same memory at these short budgets because the 260-token multimodal prefix dominates the cache footprint; its advantage comes from avoiding repeated `torch.cat` copies during decode. The important invariant is preserved in every trial: **growing output == static output**.
 ### Mixed precision on Apple MPS
 
 Measured on an 8 GB Apple M2 with the 12-layer decoder at three widths, batch-1 decode of 32 tokens,
