@@ -7,8 +7,7 @@ explicit instead of hiding them behind a large inference framework.
 
 Every module in [`vlm/`](vlm/) is hand-written: the SigLIP vision transformer, multi-head and
 grouped-query attention, rotary position embeddings, RMSNorm, configurable growing/static KV caches,
-multimodal token merging, weight tying and nucleus sampling. Nothing is imported from
-`transformers` except the SentencePiece tokenizer.
+multimodal token merging, weight tying and nucleus sampling. The only `transformers` dependency is `AutoTokenizer` for the released SentencePiece tokenizer and special-token vocabulary; model execution itself is implemented directly in PyTorch.
 
 ![PaliGemma architecture](assets/architecture.png)
 
@@ -16,11 +15,11 @@ multimodal token merging, weight tying and nucleus sampling. Nothing is imported
 
 | | |
 |---|---|
-| **Grouped-query attention + RoPE** | 8 query heads share 1 KV head (Gemma-2B). The runtime supports an exact-length growing cache and a preallocated static cache behind the same interface; GQA stores one shared KV head rather than eight, sharply reducing cache memory. |
+| **Grouped-query attention + RoPE** | 8 query heads share 1 KV head (the MQA endpoint of GQA in Gemma-2B). The runtime supports an exact-length growing cache and a preallocated static cache behind the same interface; sharing one KV head rather than eight sharply reduces cache memory. |
 | **Vision-language fusion** | Custom SigLIP encoder (27 pre-LN layers for the 3B weights; 6 in the small preset) → linear projector → features scattered into the `<image>` slots of a Gemma decoder (18 layers for the 3B weights, **12 layers** in the `paligemma_small` preset). Bidirectional prefix attention, causal generation. |
 | **Detection** | `detect <object>` prompts decode to `<locYYYY>` tokens on a 1024-grid; [`vlm/detection.py`](vlm/detection.py) rescales them to pixel boxes and draws them. |
 | **Runtime controls** | CUDA → MPS → CPU placement, explicit weight dtype, autocast compute policy, growing vs. static KV-cache strategies, top-p/greedy decoding, shard-streamed SafeTensors loading, stage profiling and reproducible benchmark artifacts. |
-| **Verified against the real checkpoint** | Config, preprocessor and all 300+ weight names match `google/paligemma-3b-pt-224` (checked via its ungated mirror, see [Verification](#verification-against-the-released-checkpoint)). |
+| **Verified against released checkpoint artifacts** | Config, preprocessing conventions and checkpoint key layout were cross-checked against `google/paligemma-3b-pt-224` via its ungated mirror. When real weights are loaded, the loader validates the complete expected persistent key set and rejects missing or unexpected keys; representative layout keys are also covered by unit tests. See [Verification](#verification-against-the-released-checkpoint). |
 
 ## Results
 
@@ -64,12 +63,7 @@ best of 3 after warm-up (`python scripts/make_figures.py`).
 | d = 1024 | 176 M | 34.7 tok/s | 35.2 tok/s | 35.1 tok/s | 705 → 352 MB |
 | d = 1536 | 375 M | 26.1 tok/s | 14.1 tok/s | 9.8 tok/s | 1500 → 750 MB |
 
-**Honest read:** on this machine batch-1 decoding is kernel-launch bound, so half precision does not
-speed it up (it is slower at d = 1536, where an 8 GB laptop is also under memory pressure). What half
-precision reliably buys is the **2× smaller weight footprint** — 5.8 GB instead of 11.7 GB for the 3B
-checkpoint — which is what makes the model fit on a 16 GB Mac or an 8 GB GPU. Throughput gains from
-autocast need tensor cores (CUDA) and larger batches; `inference.py` enables autocast on both back-ends
-and lets you turn it off with `--autocast False`.
+**Honest read:** on this machine, half precision did not improve batch-1 decode throughput; at d = 1536 it was slower. Likely contributors include kernel-launch overhead, memory movement, kernel availability and memory pressure, but this experiment did **not** isolate the root cause. What half precision reliably buys is the **2× smaller weight footprint** — about 5.8 GB instead of 11.7 GB for the 3B checkpoint weights. That brings the parameter footprint into a range that can make inference feasible on memory-constrained accelerators, subject to additional activation, KV-cache and framework overhead. CUDA and larger batches are natural next workloads to test for throughput benefits. `inference.py` enables autocast on both accelerator back-ends and lets you turn it off with `--autocast False`.
 
 ### Detection decoding
 
@@ -242,7 +236,7 @@ Fetched on 2026-09-17 from the ungated mirror and from `transformers` v4.49.0 so
 | Item | Source | Matches this repo |
 |---|---|---|
 | `config.json` — SigLIP 1152 / 4304 / 27 layers / 16 heads / patch 14; Gemma 2048 / 16384 / 18 layers / 8 heads / 1 KV head; vocab 257 216; image token 257 152 | [`hehe156/paligemma-3b-pt-224/config.json`](https://huggingface.co/hehe156/paligemma-3b-pt-224/blob/main/config.json) | ✅ `paligemma_3b_224()` |
-| `model.safetensors.index.json` — every `vision_tower.*`, `multi_modal_projector.linear.*`, `language_model.model.*` key; no `lm_head` (tied) | [index](https://huggingface.co/hehe156/paligemma-3b-pt-224/blob/main/model.safetensors.index.json) | ✅ `state_dict()` keys, tied head handled in `load_hf_model` |
+| `model.safetensors.index.json` — released `vision_tower.*`, `multi_modal_projector.linear.*`, and `language_model.model.*` layout; no independent `lm_head` tensor because it is tied | [index](https://huggingface.co/hehe156/paligemma-3b-pt-224/blob/main/model.safetensors.index.json) | ✅ `load_hf_model()` validates the complete expected persistent key set at load time and re-ties the head; representative layout keys are covered by tests |
 | `preprocessor_config.json` — mean/std 0.5, bicubic, 1/255, 224², 256 image tokens | [preprocessor](https://huggingface.co/hehe156/paligemma-3b-pt-224/blob/main/preprocessor_config.json) | ✅ `processing.py` |
 | RMSNorm `(1 + w)` in fp32, `rotate_half`, `√d` embedding scale, GeGLU, `repeat_kv` | [`modeling_gemma.py`](https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/gemma/modeling_gemma.py) | ✅ |
 | Image features ÷ `√text_hidden`, `masked_scatter` merge, bidirectional prefix mask | [`modeling_paligemma.py`](https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/paligemma/modeling_paligemma.py) | ✅ |
